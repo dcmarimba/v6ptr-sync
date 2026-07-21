@@ -1,0 +1,12 @@
+# Runtime config may contain a TSIG secret — never commit the live ini
+v6ptr.ini
+# Runtime state (the provenance ledger) — machine-specific, not source
+state.json
+/var/opt/v6ptr/
+# TSIG key material and the transient key file the tool writes
+*.key
+.v6ptr-key.*
+# Python
+__pycache__/
+*.pyc
+*.pyo

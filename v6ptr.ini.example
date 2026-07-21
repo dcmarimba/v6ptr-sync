@@ -1,0 +1,62 @@
+; v6ptr.ini — config for v6ptr-sync.py
+; Config lives here (sealed-box pattern); runtime state is separate JSON.
+
+[dns]
+; Internal BIND that holds your ip6.arpa reverse zone. This is the server the
+; tool UPDATES (nsupdate) and reads the reverse zone from (dig). If BIND is
+; containerised/published on a non-standard port, set it here — the port
+; applies ONLY to this update/zone-read path, NOT to the v4->hostname reverse
+; lookups (those go through the normal system resolver on port 53).
+server = 127.0.0.1
+port = 53
+; --- TSIG key for nsupdate: choose ONE of the two options below ---
+; Option A — point to an existing BIND-format key file:
+keyfile = /etc/v6ptr/ddns.key
+; Option B — put the key inline in THIS file instead (sealed-box friendly).
+; If key_secret is non-empty it takes precedence over keyfile. The script
+; writes a temporary 0600 key file (in /dev/shm when available, so the secret
+; stays in RAM) for nsupdate and deletes it after each run — the secret never
+; appears in the process list. Must match the key BIND authorises for updates.
+key_name = ddns-key
+key_algorithm = hmac-sha256
+key_secret =
+; Optional: force a specific zone. Blank = let nsupdate discover it via SOA,
+; which is fine as long as BIND is authoritative for the GUA reverse zone.
+zone =
+ttl = 300
+
+[correlation]
+; Restrict to specific interfaces (comma list). Blank = all. On the gateway
+; you almost certainly want to exclude the WAN/PPPoE side and keep LAN/VLANs.
+interfaces = bond1
+; Scopes to publish: gua (default) or gua,ula. Link-local is never published.
+scopes = gua
+; Reverse resolver: 'system' = socket.gethostbyaddr (honours nsswitch/hosts),
+; 'dig' = dig -x (pure DNS, ignores /etc/hosts). 'system' is fine on most hosts.
+resolver = system
+; Optional: only borrow names ending in this domain, to avoid publishing
+; upstream/foreign PTRs. Blank = accept any name the v4 side returns.
+only_domain = example.com
+; Addresses/prefixes this tool must NEVER manage — your statically-assigned
+; server GUAs whose PTRs you maintain by hand. Comma list of addresses and/or
+; CIDRs. The tool skips these entirely, so it can't clobber curated records.
+; e.g.: 2001:8b0:fcd0:27::10, 2001:8b0:fcd0:27::20, 2001:8b0:fcd0:99::/64
+exclude =
+; Grace window (days) before a vanished GUA's PTR is reaped. Set comfortably
+; past the RFC 8981 privacy valid-lifetime (~7d) so live-but-quiet addresses
+; are not culled. 14 is a safe default.
+grace_days = 14
+
+[state]
+path = /var/opt/v6ptr/state.json
+
+[marker]
+; Provenance markers let the tool recover after a lost state file WITHOUT any
+; risk of clobbering records it didn't create. On create it writes a TXT
+; alongside the PTR reading "v6ptr-sync1:<id>"; a record is only ever treated
+; as the tool's own if that exact TXT is present. Your hand-maintained static
+; PTRs carry no such marker, so they stay untouchable.
+; Generate an id once with:  python3 v6ptr-sync.py --gen-marker-id
+; then paste it below. Requires dig.
+enabled = true
+id =
