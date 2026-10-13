@@ -19,6 +19,10 @@ ULA optional. No forward (AAAA) records are created.
 Dry-run is the DEFAULT: it prints the exact nsupdate transaction and writes
 nothing. Pass --apply to actually push and commit state.
 
+Pass --log PATH to also write timestamped run output and errors to a
+size-rotated log file (limits in the optional [logging] config section).
+Intended for cron, whose output is otherwise discarded on Gaia.
+
 Stdlib only (json, subprocess, shutil, ipaddress, socket, argparse, ...).
 No sqlite3 dependency, no dig dependency (unless resolver=dig in config).
 """
@@ -27,6 +31,8 @@ import argparse
 import configparser
 import ipaddress
 import json
+import logging
+import logging.handlers
 import os
 import secrets
 import shutil
@@ -53,12 +59,19 @@ USABLE_STATES = {"REACHABLE", "STALE", "DELAY", "PROBE", "PERMANENT", "NOARP"}
 MARKER_SENTINEL = "v6ptr-sync1"
 
 # Bumped when behaviour changes meaningfully; shown in the dry-run debug header.
-VERSION = "1.0"
+VERSION = "1.1"
 
 # Explicit candidate dirs, searched after shutil.which(), because a cron/
 # scheduler PATH on Gaia rarely matches the interactive expert shell.
 BIN_CANDIDATES = ("/bin", "/sbin", "/usr/bin", "/usr/sbin",
                   "/usr/local/bin", "/usr/local/sbin")
+
+# Rotation defaults when --log is given and [logging] doesn't override them:
+# 1 MiB x 5 backups caps disk use at ~6 MiB, which is months of hourly runs.
+LOG_MAX_BYTES = 1024 * 1024
+LOG_BACKUPS = 5
+
+log = logging.getLogger("v6ptr-sync")
 
 
 # --- binary + config resolution ------------------------------------------
@@ -116,6 +129,54 @@ def load_config(path):
     else:
         c["marker_string"] = None
     return c
+
+
+# --- logging --------------------------------------------------------------
+def read_log_settings(path):
+    """Read rotation limits from the optional [logging] section.
+
+    Args:
+        path: config file path. Read independently of load_config() and
+              tolerant of a missing/unreadable file, so that logging is
+              already up when load_config() fails and that failure is logged.
+
+    Returns (max_bytes, backups), falling back to the module defaults.
+    """
+    cp = configparser.ConfigParser()
+    cp.read(path)
+    return (cp.getint("logging", "max_bytes", fallback=LOG_MAX_BYTES),
+            cp.getint("logging", "backups", fallback=LOG_BACKUPS))
+
+
+def setup_logging(log_path, max_bytes, backups):
+    """Route the module logger to stderr and, optionally, a rotating file.
+
+    Args:
+        log_path: file to append to, or None for stderr only.
+        max_bytes: rotate once the file would exceed this size.
+        backups: number of rotated files (.1 .. .N) to keep.
+
+    Side effects: replaces any handlers already on the logger (so repeated
+    calls in one process don't duplicate lines); creates the log file's
+    directory if needed. stderr keeps the bare message so interactive output
+    is unchanged; the file gets a timestamp and level on every line.
+    """
+    for h in list(log.handlers):
+        log.removeHandler(h)
+        h.close()
+    log.setLevel(logging.INFO)
+    log.propagate = False
+    err = logging.StreamHandler(sys.stderr)
+    err.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(err)
+    if log_path:
+        d = os.path.dirname(os.path.abspath(log_path))
+        os.makedirs(d, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(
+            log_path, maxBytes=max_bytes, backupCount=backups)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%dT%H:%M:%S%z"))
+        log.addHandler(fh)
 
 
 # --- ip neigh parsing (plain text; this iproute2 has no -j) ---------------
@@ -604,12 +665,39 @@ def main():
     ap.add_argument("--gen-marker-id", action="store_true",
                     help="print a fresh random marker id and exit")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--log", metavar="PATH",
+                    help="also append timestamped output and errors to PATH, "
+                         "size-rotated per the [logging] config section")
     args = ap.parse_args()
 
     if args.gen_marker_id:
         print(secrets.token_hex(16))
         return
 
+    setup_logging(args.log, *read_log_settings(args.config))
+    # Fatal paths use sys.exit("message") or raise; catch both here so an
+    # unattended cron run leaves its failure in the log, not just on stderr.
+    try:
+        run(args)
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            log.error(e.code)
+            sys.exit(1)
+        raise
+    except Exception:
+        log.exception("unhandled error")
+        sys.exit(1)
+
+
+def run(args):
+    """One sync pass: read neighbours, reconcile, then dry-run or apply.
+
+    Args:
+        args: parsed command-line arguments (config, apply).
+
+    Side effects: with args.apply, sends nsupdate transactions and rewrites
+    the state ledger; otherwise prints the dry-run document to stdout.
+    """
     cfg = load_config(args.config)
     cfg["exclude_nets"] = build_excludes(cfg["exclude"])
     ip_bin = resolve_binary("ip")
@@ -699,16 +787,13 @@ def main():
         return
 
     # ---------------- apply: side-effecting ---------------------------------
-    print(f"# observed {len(observed)} | create {counts['create']} "
-          f"overwrite {counts['overwrite']} reap {counts['reap']} "
-          f"| re-adopt {counts['readopt']} | pre-existing {counts['preexisting']}",
-          file=sys.stderr)
+    log.info(f"# observed {len(observed)} | create {counts['create']} "
+             f"overwrite {counts['overwrite']} reap {counts['reap']} "
+             f"| re-adopt {counts['readopt']} | pre-existing {counts['preexisting']}")
     for p in preexisting:
-        print(f"# pre-existing PTR, NOT managed: {p['gua']} -> '{p['existing']}'",
-              file=sys.stderr)
+        log.info(f"# pre-existing PTR, NOT managed: {p['gua']} -> '{p['existing']}'")
     for a in readopted:
-        print(f"# re-adopted from marker: {a['gua']} -> '{a['name']}'",
-              file=sys.stderr)
+        log.info(f"# re-adopted from marker: {a['gua']} -> '{a['name']}'")
 
     key_path, key_is_temp = materialize_key(cfg)
     try:
@@ -729,28 +814,26 @@ def main():
     # name every op that actually changed DNS, so the writes aren't anonymous
     for op in applied:
         if op["kind"] == "create":
-            print(f"# CREATED  {op['gua']} -> '{op['name']}'"
-                  + (f"  (borrowed from {op['v4']})" if op.get("v4") else ""),
-                  file=sys.stderr)
+            log.info(f"# CREATED  {op['gua']} -> '{op['name']}'"
+                     + (f"  (borrowed from {op['v4']})" if op.get("v4") else ""))
         elif op["kind"] == "overwrite":
-            print(f"# OVERWROTE {op['gua']}: '{op['prev_name']}' -> "
-                  f"'{op['name']}'", file=sys.stderr)
+            log.info(f"# OVERWROTE {op['gua']}: '{op['prev_name']}' -> "
+                     f"'{op['name']}'")
         elif op["kind"] == "reap":
-            print(f"# REAPED   {op['gua']} (was '{op['name']}', past grace)",
-                  file=sys.stderr)
+            log.info(f"# REAPED   {op['gua']} (was '{op['name']}', past grace)")
     for op, err in relinquished:
-        print(f"# RELINQUISHED {op['kind']} {op['gua']}: zone diverged from our "
-              f"record (prerequisite failed) — left untouched, dropped from "
-              f"ledger. {err}", file=sys.stderr)
+        log.warning(f"# RELINQUISHED {op['kind']} {op['gua']}: zone diverged "
+                    f"from our record (prerequisite failed) — left untouched, "
+                    f"dropped from ledger. {err}")
 
     n_c = sum(o["kind"] == "create" for o in applied)
     n_o = sum(o["kind"] == "overwrite" for o in applied)
     n_r = sum(o["kind"] == "reap" for o in applied)
-    print(f"done: {n_c} created, {n_o} overwritten, {n_r} reaped, "
-          f"{len(readopted)} re-adopted, {len(preexisting)} pre-existing "
-          f"(untouched)"
-          + (f", {len(relinquished)} relinquished" if relinquished else "")
-          + f"; ledger now tracks {len(records)} records", file=sys.stderr)
+    log.info(f"done: {n_c} created, {n_o} overwritten, {n_r} reaped, "
+             f"{len(readopted)} re-adopted, {len(preexisting)} pre-existing "
+             f"(untouched)"
+             + (f", {len(relinquished)} relinquished" if relinquished else "")
+             + f"; ledger now tracks {len(records)} records")
 
 
 if __name__ == "__main__":

@@ -197,7 +197,7 @@ print("atomic state write: OK  (mkdir + atomic replace)")
 # to save_state_atomic, which the unit-level round-trip above never exercised.
 import io, sys, types, contextlib
 
-def run_apply(ini, v6_text, now, zone_calls, nsupdates):
+def run_apply(ini, v6_text, now, zone_calls, nsupdates, extra_args=()):
     """Run main() with --apply against stubbed neighbour tables, resolver,
     zone reader and nsupdate. Side effects: appends every zone read to
     zone_calls and every nsupdate script to nsupdates."""
@@ -218,7 +218,7 @@ def run_apply(ini, v6_text, now, zone_calls, nsupdates):
     v.make_zone_reader = zone_reader_factory
     v.subprocess.run = fake_run
     v.time.time = lambda: now
-    sys.argv = ["v6ptr-sync.py", "-c", ini, "--apply"]
+    sys.argv = ["v6ptr-sync.py", "-c", ini, "--apply", *extra_args]
     try:
         with contextlib.redirect_stderr(io.StringIO()):
             v.main()
@@ -255,5 +255,42 @@ with tempfile.TemporaryDirectory() as d:
     left = json.load(open(sp))["records"]
     assert not any(g.startswith("2a00:1450:4009:1::1") or g.endswith("e5f6") for g in left), left
 print("end-to-end --apply: OK  (ledger persists across runs; absent devices reap)")
+
+# --- --log: timestamped file output, size rotation, fatal errors captured ---
+import re as _re
+with tempfile.TemporaryDirectory() as d:
+    sp = os.path.join(d, "state.json"); lp = os.path.join(d, "logs", "v6ptr.log")
+    ini = os.path.join(d, "t.ini")
+    open(ini, "w").write(f"[dns]\nserver = 127.0.0.1\n"
+                         f"[correlation]\nscopes = gua\n"
+                         f"[state]\npath = {sp}\n"
+                         f"[logging]\nmax_bytes = 2000\nbackups = 2\n")
+    run_apply(ini, V6, 1_700_000_000.0, [], [], ("--log", lp))
+    lines = open(lp).read().splitlines()
+    stamp = _re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4} INFO ")
+    assert lines and all(stamp.match(l) for l in lines), lines
+    assert any("# CREATED" in l for l in lines) and "done:" in lines[-1]
+
+    for i in range(20):  # second+ runs log ~250 bytes each; 2000-byte cap
+        run_apply(ini, V6, 1_700_000_000.0 + 3600 * (i + 1), [], [], ("--log", lp))
+    logs = sorted(f for f in os.listdir(os.path.dirname(lp)))
+    assert logs == ["v6ptr.log", "v6ptr.log.1", "v6ptr.log.2"], logs
+    assert all(os.path.getsize(os.path.join(d, "logs", f)) <= 2000 for f in logs)
+
+    # a fatal sys.exit path (unreadable config) still lands in the log, rc 1
+    saved_argv = sys.argv
+    sys.argv = ["v6ptr-sync.py", "-c", os.path.join(d, "missing.ini"),
+                "--apply", "--log", lp]
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            v.main()
+        raise AssertionError("expected SystemExit")
+    except SystemExit as e:
+        assert e.code == 1, e.code
+    finally:
+        sys.argv = saved_argv
+        v.setup_logging(None, 0, 0)  # release the file handle
+    assert "ERROR   config file not readable" in open(lp).read().splitlines()[-1]
+print("--log: OK  (timestamped lines; rotates at max_bytes keeping N; fatal errors logged, rc 1)")
 
 print("\nALL TESTS PASSED")

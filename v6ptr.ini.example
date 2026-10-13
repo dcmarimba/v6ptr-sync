@@ -60,3 +60,10 @@ path = /var/opt/v6ptr/state.json
 ; then paste it below. Requires dig.
 enabled = true
 id =
+
+[logging]
+; Only used when the script is run with --log PATH. The log rotates once it
+; would exceed max_bytes, keeping `backups` old files (PATH.1 .. PATH.N), so
+; disk use is capped at roughly max_bytes * (backups + 1).
+max_bytes = 1048576
+backups = 5

@@ -115,6 +115,8 @@ edit. Key sections:
   `exclude` (addresses/prefixes never to manage — e.g. static server GUAs),
   `grace_days` (reap delay; keep past the ~7-day privacy valid-lifetime).
 - `[state]` — `path` to the JSON ledger.
+- `[logging]` — `max_bytes` and `backups` for the `--log` file (defaults
+  1 MiB × 5). Ignored unless `--log` is passed.
 - `[marker]` — `enabled` and `id`. Generate the id once with
   `python3 v6ptr-sync.py --gen-marker-id` and keep it (and the config) in your
   backups; it is the root of provenance identity across state loss.
@@ -131,6 +133,10 @@ python3 v6ptr-sync.py -c /etc/v6ptr.ini
 
 # APPLY: push guarded nsupdate transactions and commit the ledger.
 python3 v6ptr-sync.py -c /etc/v6ptr.ini --apply
+
+# APPLY from cron: also append timestamped output and any fatal error to a
+# size-rotated log (stderr output is unchanged).
+python3 v6ptr-sync.py -c /etc/v6ptr.ini --apply --log /var/log/v6ptr-sync.log
 
 # run the test suite (no network/DNS touched)
 python3 test_v6ptr.py
@@ -161,9 +167,9 @@ ledger; subsequent runs short-circuit known records and are fast.
   forward-confirmed uses without revisiting.
 - **Scheduling:** on Check Point Gaia it runs hourly from cron (added via
   clish `add cron job`, since Gaia regenerates the crontab). Gaia cron sets
-  `MAILTO=""`, so redirect output to a log or the per-op `CREATED` /
-  `REAPED` / `RELINQUISHED` lines are lost:
-  `python3 v6ptr-sync.py -c v6ptr.ini --apply >> v6ptr-sync.log 2>&1`.
+  `MAILTO=""`, so pass `--log PATH` or the per-op `CREATED` / `REAPED` /
+  `RELINQUISHED` lines and any failure are lost. An existing job's command
+  can be changed in place with clish `set cron job <name> command "..."`.
   A systemd oneshot + timer is still planned for non-Gaia hosts — see
   §"Roadmap".
 - **Upgrading from a pre-fix ledger:** versions before the ledger-envelope fix
