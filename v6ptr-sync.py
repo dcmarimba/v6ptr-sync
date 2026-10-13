@@ -480,9 +480,11 @@ def apply_ops(ops, records, cfg, nsupdate_bin, key_path):
     we RELINQUISH the record (drop it from the ledger) and report it — the
     tool never fights another writer.
 
-    Returns (applied, relinquished) for reporting."""
+    Returns (applied, relinquished) where applied is the list of ops that
+    actually changed DNS (so each can be named) and relinquished lists ops the
+    server refused."""
     now = time.time()
-    applied, relinquished = 0, []
+    applied, relinquished = [], []
     for op in ops:
         args = [nsupdate_bin] + (["-k", key_path] if key_path else [])
         r = subprocess.run(args, input=op_nsupdate_script(op, cfg),
@@ -494,7 +496,7 @@ def apply_ops(ops, records, cfg, nsupdate_bin, key_path):
                 records[op["gua"]] = {
                     "ptr": op["ptr"], "name": op["name"], "mac": op.get("mac"),
                     "first_seen": now, "last_seen": now}
-                applied += 1
+                applied.append(op)
             else:
                 # nxrrset failed: something appeared we don't own. Don't claim.
                 relinquished.append((op, r.stderr.strip()))
@@ -504,7 +506,7 @@ def apply_ops(ops, records, cfg, nsupdate_bin, key_path):
                 records[op["gua"]] = {
                     "ptr": op["ptr"], "name": op["name"], "mac": op.get("mac"),
                     "first_seen": prev.get("first_seen", now), "last_seen": now}
-                applied += 1
+                applied.append(op)
             else:
                 # yxrrset failed: changed out from under us -> back off for good
                 records.pop(op["gua"], None)
@@ -514,7 +516,7 @@ def apply_ops(ops, records, cfg, nsupdate_bin, key_path):
             # fail-> changed out from under us; we did NOT delete anything
             records.pop(op["gua"], None)
             if ok:
-                applied += 1
+                applied.append(op)
             else:
                 relinquished.append((op, r.stderr.strip()))
     return applied, relinquished
@@ -696,7 +698,7 @@ def main():
         print("\n".join(out))
         return
 
-    # ---------------- apply: terse, side-effecting --------------------------
+    # ---------------- apply: side-effecting ---------------------------------
     print(f"# observed {len(observed)} | create {counts['create']} "
           f"overwrite {counts['overwrite']} reap {counts['reap']} "
           f"| re-adopt {counts['readopt']} | pre-existing {counts['preexisting']}",
@@ -719,12 +721,32 @@ def main():
             except OSError:
                 pass
     save_state_atomic(cfg["state_path"], records)
-    print(f"applied {applied} op(s); ledger committed "
-          f"({len(records)} records tracked)", file=sys.stderr)
+
+    # name every op that actually changed DNS, so the writes aren't anonymous
+    for op in applied:
+        if op["kind"] == "create":
+            print(f"# CREATED  {op['gua']} -> '{op['name']}'"
+                  + (f"  (borrowed from {op['v4']})" if op.get("v4") else ""),
+                  file=sys.stderr)
+        elif op["kind"] == "overwrite":
+            print(f"# OVERWROTE {op['gua']}: '{op['prev_name']}' -> "
+                  f"'{op['name']}'", file=sys.stderr)
+        elif op["kind"] == "reap":
+            print(f"# REAPED   {op['gua']} (was '{op['name']}', past grace)",
+                  file=sys.stderr)
     for op, err in relinquished:
         print(f"# RELINQUISHED {op['kind']} {op['gua']}: zone diverged from our "
               f"record (prerequisite failed) — left untouched, dropped from "
               f"ledger. {err}", file=sys.stderr)
+
+    n_c = sum(o["kind"] == "create" for o in applied)
+    n_o = sum(o["kind"] == "overwrite" for o in applied)
+    n_r = sum(o["kind"] == "reap" for o in applied)
+    print(f"done: {n_c} created, {n_o} overwritten, {n_r} reaped, "
+          f"{len(readopted)} re-adopted, {len(preexisting)} pre-existing "
+          f"(untouched)"
+          + (f", {len(relinquished)} relinquished" if relinquished else "")
+          + f"; ledger now tracks {len(records)} records", file=sys.stderr)
 
 
 if __name__ == "__main__":
