@@ -192,4 +192,68 @@ with tempfile.TemporaryDirectory() as d:
     assert json.load(open(p))["records"]["2a00:1450:4009:1::100"]["name"] == "laptop-1.example.com"
 print("atomic state write: OK  (mkdir + atomic replace)")
 
+# --- end-to-end --apply: ledger persists across runs, absent devices reap ---
+# Drives main() itself, because the state envelope bug lived in main()'s call
+# to save_state_atomic, which the unit-level round-trip above never exercised.
+import io, sys, types, contextlib
+
+def run_apply(ini, v6_text, now, zone_calls, nsupdates):
+    """Run main() with --apply against stubbed neighbour tables, resolver,
+    zone reader and nsupdate. Side effects: appends every zone read to
+    zone_calls and every nsupdate script to nsupdates."""
+    def zone_reader_factory(cfg, dig_bin):
+        def read(gua):
+            zone_calls.append(gua)
+            return {"ptr": None, "ours": False}
+        return read
+    def fake_run(args, input=None, **kw):
+        nsupdates.append(input)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    saved = (v.run_ip_neigh, v.resolve_binary, v.reverse_resolve_system,
+             v.make_zone_reader, v.subprocess.run, v.time.time, sys.argv)
+    v.run_ip_neigh = lambda ip_bin, fam: v6_text if fam == "-6" else V4
+    v.resolve_binary = lambda name: "/stub/" + name
+    v.reverse_resolve_system = lambda ip: {"192.168.10.100": "laptop-1.example.com",
+                                           "192.168.10.200": "phone-2.example.com"}.get(ip)
+    v.make_zone_reader = zone_reader_factory
+    v.subprocess.run = fake_run
+    v.time.time = lambda: now
+    sys.argv = ["v6ptr-sync.py", "-c", ini, "--apply"]
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            v.main()
+    finally:
+        (v.run_ip_neigh, v.resolve_binary, v.reverse_resolve_system,
+         v.make_zone_reader, v.subprocess.run, v.time.time, sys.argv) = saved
+
+with tempfile.TemporaryDirectory() as d:
+    ini = os.path.join(d, "t.ini"); sp = os.path.join(d, "state.json")
+    open(ini, "w").write(f"[dns]\nserver = 127.0.0.1\n"
+                         f"[correlation]\nscopes = gua\ngrace_days = 14\n"
+                         f"[state]\npath = {sp}\n")
+    t0 = 1_700_000_000.0
+
+    zc, ns = [], []
+    run_apply(ini, V6, t0, zc, ns)
+    saved_state = json.load(open(sp))
+    assert set(saved_state) == {"version", "records"}, saved_state.keys()
+    n_tracked = len(saved_state["records"])
+    assert n_tracked and len(ns) == n_tracked
+
+    # second run, same neighbours: ledger must short-circuit every zone read
+    zc, ns = [], []
+    run_apply(ini, V6, t0 + 3600, zc, ns)
+    assert zc == [] and ns == [], (zc, ns)
+    assert len(json.load(open(sp))["records"]) == n_tracked
+
+    # device 00:11:22:33:44:55 vanishes; past grace its GUAs must be reaped
+    v6_gone = "\n".join(l for l in V6.splitlines() if "00:11:22:33:44:55" not in l)
+    zc, ns = [], []
+    run_apply(ini, v6_gone, t0 + 15 * 86400, zc, ns)
+    reaps = [s for s in ns if "update delete" in s and "prereq yxrrset" in s]
+    assert len(reaps) == 2, ns
+    left = json.load(open(sp))["records"]
+    assert not any(g.startswith("2a00:1450:4009:1::1") or g.endswith("e5f6") for g in left), left
+print("end-to-end --apply: OK  (ledger persists across runs; absent devices reap)")
+
 print("\nALL TESTS PASSED")

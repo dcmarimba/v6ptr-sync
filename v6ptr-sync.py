@@ -720,7 +720,11 @@ def main():
                 os.unlink(key_path)
             except OSError:
                 pass
-    save_state_atomic(cfg["state_path"], records)
+    # Persist the full {"version", "records"} envelope that load_state() and
+    # reconcile() read back. Saving the bare records dict made every run see
+    # an empty ledger: records were only ever re-adopted from markers, and
+    # absent devices were never reaped.
+    save_state_atomic(cfg["state_path"], new_state)
 
     # name every op that actually changed DNS, so the writes aren't anonymous
     for op in applied:

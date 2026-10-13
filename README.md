@@ -159,14 +159,28 @@ ledger; subsequent runs short-circuit known records and are fast.
 - Reverse-only by design: these PTRs have no matching AAAA and won't
   forward-confirm (FCrDNS). Fine for log labelling; don't repurpose for
   forward-confirmed uses without revisiting.
-- **Scheduling (TODO):** intended to run under a systemd oneshot + timer with
-  journald logging. Units are not yet in the repo — see §"Roadmap".
+- **Scheduling:** on Check Point Gaia it runs hourly from cron (added via
+  clish `add cron job`, since Gaia regenerates the crontab). Gaia cron sets
+  `MAILTO=""`, so redirect output to a log or the per-op `CREATED` /
+  `REAPED` / `RELINQUISHED` lines are lost:
+  `python3 v6ptr-sync.py -c v6ptr.ini --apply >> v6ptr-sync.log 2>&1`.
+  A systemd oneshot + timer is still planned for non-Gaia hosts — see
+  §"Roadmap".
+- **Upgrading from a pre-fix ledger:** versions before the ledger-envelope fix
+  saved `state.json` as a bare `{gua: record}` map, which the next run read as
+  empty. Nothing was clobbered (records were re-adopted from markers), but
+  **no record was ever reaped**, so stale marked PTRs from rotated privacy
+  addresses accumulated in the zone. The fixed version reads such a file as
+  empty once, re-adopts what it currently sees, and persists correctly from
+  then on. Marked records already stranded by the bug need a one-off cleanup.
 
 ## Roadmap / not-yet-done
 
 - systemd `oneshot` service + `timer` units (planned; e.g. every 15 min).
 - Optional parallel DNS lookups to speed cold runs (steady state is already
   fast; only cold/dry runs are slow).
+- One-off cleanup of marked PTRs stranded by the pre-fix ledger bug (see
+  §"Deployment notes"); an AXFR-based rebuild below would subsume it.
 - Optional AXFR-based eager ledger rebuild (current re-adoption is lazy: it
   recovers a marked record only when its GUA is next observed).
 
